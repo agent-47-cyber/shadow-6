@@ -6,6 +6,7 @@ in src/ui/layout.py; custom widgets in src/ui/widgets.py.
 """
 
 import logging
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -221,8 +222,6 @@ class Dashboard(ctk.CTkToplevel):
         self._colors: ThemeColors = get_colors(self._settings.theme)
         self._current_tab = "general"
         self._tab_frames: dict[str, ctk.CTkFrame] = {}
-        # Prewarm: hidden tab -> widgets still waiting to be mapped (see _prewarm_tabs)
-        self._warming: dict[str, list] = {}
         self._tabs: dict[str, object] = {}
         self._last_col_count = 0  # track responsive state
         self._tab_built_cols: dict[str, int] = {}  # col count each tab was built with
@@ -265,7 +264,9 @@ class Dashboard(ctk.CTkToplevel):
 
         # Register as the active singleton BEFORE mainloop blocks
         global _active_dashboard
-        _active_dashboard = self
+        with _dashboard_lock:
+            _active_dashboard = self
+        self.after(50, self._process_dashboard_requests)
 
         if self._own_root:
             self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -479,7 +480,6 @@ class Dashboard(ctk.CTkToplevel):
 
         # Clear tab frame references
         self._tab_frames.clear()
-        self._warming.clear()
         self._tabs.clear()
         self._last_col_count = 0
         self._tab_built_cols.clear()
@@ -491,7 +491,6 @@ class Dashboard(ctk.CTkToplevel):
         self._build_topbar()
         self._build_content_area()
         self._show_tab(current_tab)
-        self._schedule_prewarm()
 
         # Re-bind resize
         self._content.bind("<Configure>", self._on_content_resize)
@@ -509,8 +508,6 @@ class Dashboard(ctk.CTkToplevel):
         self._current_tab = key
         # Lazy build on first visit; rebuild if the tab was built for a
         # different column count (the old stale-layout-until-resize glitch)
-        if key in self._warming:
-            self._finish_warming(key)
         if key not in self._tab_frames:
             self._build_tab(key)
         elif self._tab_built_cols.get(key) != self._get_col_count():
@@ -525,126 +522,16 @@ class Dashboard(ctk.CTkToplevel):
                 fg_color=self._colors.accent_muted if gear_active else "transparent",
                 text_color=self._colors.accent if gear_active else self._colors.fg_secondary,
             )
-        # Show the right frame. Prewarmed tabs stay placed (mapped, stacked
-        # under the visible one): showing them is just a lift.
+        # Keep only the selected tab mapped; other tabs are built lazily.
         for k, frame in self._tab_frames.items():
             if k == key:
-                if not self._is_placed(frame):
+                if frame.winfo_manager() != "pack":
                     frame.pack(fill="both", expand=True)
                 frame.lift()
-            elif not self._is_placed(frame):
+            else:
                 frame.pack_forget()
 
-    @staticmethod
-    def _is_placed(frame) -> bool:
-        try:
-            return frame._parent_frame.winfo_manager() == "place"
-        except Exception:
-            return False
-
-    # -- Prewarm ----------------------------------------------------------------
-    # On Windows, Tk needs a few ms per widget window the first time it is
-    # mapped, and a scrollable tab maps all of its (hundreds of) windows at
-    # once: Models/Settings took 2-5 s to appear. So once the window is open,
-    # unvisited tabs are built hidden (stacked under the visible tab) and their
-    # top-level sections are mapped one per idle tick. They stay placed there
-    # (unmapping the frame would unmap every descendant again): showing one
-    # later only raises it above the others.
-
-    _PREWARM_DELAY_MS = 300
-
-    def _schedule_prewarm(self) -> None:
-        try:
-            self.after(self._PREWARM_DELAY_MS, self._prewarm_next)
-        except Exception:
-            pass
-
-    def _prewarm_next(self) -> None:
-        if self._onboarding is not None or self._warming:
-            return
-        try:
-            if not self.winfo_exists():
-                return
-        except Exception:
-            return
-        if getattr(self, "_resize_job", None):
-            return  # column count still settling; _on_cols_settled reschedules
-        cols = self._get_col_count()
-        key = next((k for k in TAB_CLASSES if k != self._current_tab and (
-            k not in self._tab_frames or self._tab_built_cols.get(k) != cols)), None)
-        if key is None:
-            return
-        try:
-            old = self._tab_frames.pop(key, None)
-            if old is not None:
-                old.destroy()
-            self._build_tab(key)
-            frame = self._tab_frames[key]
-            pending = []
-            for child in frame.winfo_children():
-                manager = child.winfo_manager()
-                if manager == "pack":
-                    pending.append((child, manager, self._pack_args(child)))
-                    child.pack_forget()
-                elif manager == "grid":
-                    pending.append((child, manager, None))
-                    child.grid_remove()
-            # Under the visible tab, but above _content's own background canvas
-            frame.place(x=0, y=0, relwidth=1, relheight=1)
-            current = self._tab_frames.get(self._current_tab)
-            frame.lower(current._parent_frame if current is not None else None)
-        except Exception:
-            log.exception("Prewarming tab %s failed", key)
-            self._tab_frames.pop(key, None)
-            return
-        self._warming[key] = pending
-        self._next_prewarm_step(key, frame)
-
-    def _next_prewarm_step(self, key: str, frame) -> None:
-        # after() then after_idle(): back-to-back timers would starve Tk's idle
-        # queue, and the mapping this prewarm is for happens in that idle pass.
-        self.after(1, lambda: self.after_idle(self._prewarm_step, key, frame))
-
-    def _prewarm_step(self, key: str, frame) -> None:
-        pending = self._warming.get(key)
-        if pending is None or self._tab_frames.get(key) is not frame:
-            self._warming.pop(key, None)
-            return
-        if pending:
-            self._remap(pending.pop(0))
-            self._next_prewarm_step(key, frame)
-            return
-        self._finish_warming(key)
-
-    @staticmethod
-    def _pack_args(child) -> dict:
-        """Arguments that re-pack *child* exactly as it was. pack_info() holds
-        the Tk values, which CTk has already scaled; a CTk widget's pack()
-        would scale them a second time, so take its own unscaled arguments."""
-        info = child.pack_info()
-        last = getattr(child, "_last_geometry_manager_call", None)
-        if last is not None:  # set by its last pack() (the current manager is pack)
-            info = {**last["kwargs"], "in": info["in"]}
-        return info
-
-    @staticmethod
-    def _remap(item) -> None:
-        child, manager, info = item
-        try:
-            if manager == "pack":
-                child.pack(**info)
-            else:
-                child.grid()
-        except Exception:
-            pass
-
-    def _finish_warming(self, key: str) -> None:
-        """Map whatever is left of a warming tab (it stays placed, see above)."""
-        pending = self._warming.pop(key, None) or []
-        for item in pending:
-            self._remap(item)
-        self._schedule_prewarm()
-
+    # -- Tab content -----------------------------------------------------------
     def _build_tab(self, key: str) -> None:
         frame = self._make_tab_frame(key)
         tab_obj = TAB_CLASSES[key](self._ctx)
@@ -682,7 +569,6 @@ class Dashboard(ctk.CTkToplevel):
             screen.frame.destroy()
         # Language/mic/model may have changed: rebuild every tab fresh.
         self._tab_frames.clear()
-        self._warming.clear()
         self._tabs.clear()
         self._tab_built_cols.clear()
         for child in self._content.winfo_children():
@@ -692,7 +578,6 @@ class Dashboard(ctk.CTkToplevel):
         self._content.pack(side="top", fill="both", expand=True)
         self._refresh_topbar_status()
         self._show_tab("general")
-        self._schedule_prewarm()
 
     def _change_model(self, new_model: str) -> None:
         """Switch models seamlessly — the model host swaps in the background (a
@@ -709,17 +594,13 @@ class Dashboard(ctk.CTkToplevel):
         for key in list(self._tab_built_cols):
             if key != self._current_tab:
                 self._tab_built_cols[key] = -1  # forces rebuild on next show
-        self._schedule_prewarm()  # ... or rebuild them in the background first
 
     def rebuild_tab(self, key: str) -> None:
         """Tear down and rebuild one tab (responsive change or content refresh)."""
         if key not in self._tab_frames:
             return
-        if key in self._warming:
-            self._finish_warming(key)
         self._tab_frames[key].pack_forget()
-        self._tab_frames[key].place_forget()  # a prewarmed tab is placed
-        self._tab_frames.pop(key)
+        self._tab_frames.pop(key).destroy()
         self._build_tab(key)
         if self._current_tab == key:
             self._tab_frames[key].pack(fill="both", expand=True)
@@ -770,7 +651,6 @@ class Dashboard(ctk.CTkToplevel):
         # skip the rebuild when the tab was already built for this column count.
         if self._tab_built_cols.get(self._current_tab) != self._get_col_count():
             self.rebuild_tab(self._current_tab)
-        self._schedule_prewarm()  # hidden tabs built for the old count go stale
 
     def _make_tab_frame(self, key: str) -> ctk.CTkScrollableFrame:
         frame = ctk.CTkScrollableFrame(
@@ -811,9 +691,35 @@ class Dashboard(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _process_dashboard_requests(self) -> None:
+        """Apply tray/second-launch requests on the Tk-owning thread."""
+        global _active_dashboard
+        try:
+            while True:
+                onboarding, initial_tab, close = _dashboard_requests.get_nowait()
+                if close:
+                    self._on_close()
+                    return
+                if onboarding:
+                    self.show_onboarding()
+                elif initial_tab:
+                    self._show_tab(initial_tab)
+                _focus_existing(self)
+        except queue.Empty:
+            pass
+        except Exception:
+            log.exception("Dashboard request could not be applied")
+        try:
+            if _active_dashboard is self and self.winfo_exists():
+                self.after(50, self._process_dashboard_requests)
+        except Exception:
+            pass
+
     def _on_close(self) -> None:
         global _active_dashboard
-        _active_dashboard = None
+        with _dashboard_lock:
+            if _active_dashboard is self:
+                _active_dashboard = None
         try:
             from ..watchdog import clear
             clear("dashboard-ui")
@@ -848,20 +754,17 @@ _onboarding_callback: Optional[Callable[[bool], None]] = None
 def set_onboarding_callback(cb: Optional[Callable[[bool], None]]) -> None:
     global _onboarding_callback
     _onboarding_callback = cb
+
+
 _dashboard_lock = threading.Lock()
+_dashboard_requests: queue.SimpleQueue = queue.SimpleQueue()
 
 
 def shutdown_dashboard() -> None:
     """Close the active dashboard cleanly. Call before app exit."""
-    global _active_dashboard
     with _dashboard_lock:
-        dash = _active_dashboard
-        if dash is not None:
-            try:
-                dash.after(0, dash._on_close)
-            except Exception:
-                pass
-            _active_dashboard = None
+        if _active_dashboard is not None:
+            _dashboard_requests.put((False, None, True))
 
 
 def _focus_existing(dash: Dashboard) -> None:
@@ -890,16 +793,11 @@ def open_dashboard(settings: Settings, on_settings_changed: Callable,
 
     with _dashboard_lock:
         if _active_dashboard is not None:
-            try:
-                dash = _active_dashboard
-                if onboarding:
-                    dash.after(0, dash.show_onboarding)
-                dash.after(0, lambda: _focus_existing(dash))
-                return
-            except Exception:
-                _active_dashboard = None
+            _dashboard_requests.put((onboarding, initial_tab, False))
+            return
 
         if _opening:
+            _dashboard_requests.put((onboarding, initial_tab, False))
             return
         _opening = True
 

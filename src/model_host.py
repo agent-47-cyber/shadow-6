@@ -32,28 +32,60 @@ def _add_existing_torch_cuda_dlls() -> None:
     """Expose an already installed PyTorch CUDA runtime to CTranslate2 on Windows.
 
     This changes only this process's DLL search path and does not import or
-    replace PyTorch. It lets the project reuse the machine's existing CUDA DLLs.
+    replace PyTorch. It also finds per-user Python installs when this app runs
+    from a PyInstaller bundle, where torch itself is intentionally not bundled.
     """
     if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
         return
-    candidates = []
+    candidates: list[Path] = []
     if os.environ.get("CUDA_PATH"):
         candidates.append(Path(os.environ["CUDA_PATH"]) / "bin")
+
+    site_packages: set[Path] = set()
+    for entry in sys.path:
+        path = Path(entry)
+        if path.name.lower() in {"site-packages", "dist-packages"}:
+            site_packages.add(path)
+    for prefix in {Path(sys.prefix), Path(sys.base_prefix)}:
+        site_packages.update((prefix / "Lib").glob("site-packages"))
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        site_packages.update((Path(appdata) / "Python").glob("Python*/site-packages"))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        site_packages.update((Path(local) / "Programs" / "Python").glob("Python*/Lib/site-packages"))
+
     try:
         spec = importlib.util.find_spec("torch")
         if not spec or not spec.origin:
             spec = None
         if spec:
             candidates.append(Path(spec.origin).parent / "lib")
-        for dll_dir in candidates:
+    except (ImportError, OSError, ValueError):
+        log.debug("Could not locate the installed PyTorch package", exc_info=True)
+
+    for package_dir in site_packages:
+        candidates.append(package_dir / "torch" / "lib")
+        nvidia_dir = package_dir / "nvidia"
+        if nvidia_dir.is_dir():
+            candidates.extend(nvidia_dir.glob("*/bin"))
+
+    seen: set[str] = set()
+    for dll_dir in candidates:
+        try:
             if not dll_dir.is_dir():
                 continue
+            key = str(dll_dir.resolve()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
             # Some CTranslate2/native dependency builds resolve secondary CUDA
             # DLLs through PATH instead of the AddDllDirectory cookie.
             os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
             _CUDA_DLL_HANDLES.append(os.add_dll_directory(str(dll_dir)))
-    except (ImportError, OSError, ValueError):
-        log.debug("Could not add installed PyTorch CUDA DLL directory", exc_info=True)
+            log.info("Added CUDA runtime DLL directory: %s", dll_dir)
+        except (OSError, ValueError):
+            log.debug("Could not add CUDA DLL directory %s", dll_dir, exc_info=True)
 
 
 def _cpu_threads() -> int:
@@ -75,10 +107,28 @@ class ModelHostError(RuntimeError):
     reply can ever be read by a later request."""
 
 
+def _watch_model_host_parent() -> None:
+    """Exit a frozen model worker if Windows closes the app that owns it."""
+    try:
+        parent = mp.parent_process()
+        if parent is None:
+            return
+        from multiprocessing.connection import wait
+        wait([parent.sentinel])
+        # Model loading/inference can be inside native code and cannot always
+        # service the shutdown queue. Releasing this orphan prevents it from
+        # keeping CPU/GPU memory after the dashboard/app process is closed.
+        os._exit(0)
+    except Exception:
+        log.debug("Model worker parent watchdog stopped", exc_info=True)
+
+
 # -- Child process -------------------------------------------------------------
 
 def _host_worker(to_child, from_child, backend: str) -> None:
     """Runs in the child process: load one model, then serve transcribe calls."""
+    threading.Thread(target=_watch_model_host_parent,
+                     name="model-host-parent-watch", daemon=True).start()
     import numpy as np  # noqa: F401 (ensures numpy is importable in the child)
     engine = None
     while True:

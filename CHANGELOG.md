@@ -7,11 +7,23 @@ Date format: `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-29
+
+### Fixed
+- Dashboard opens and repeat-launch focus requests are marshalled onto its Tk thread instead of calling Tk across threads.
+- Removed background construction of every settings tab, which could make the window report “Not Responding” while model setup was using CPU.
+- Orphaned model workers now exit when their owning app process closes.
+
+### Changed
+- The packaged app searches the existing per-user PyTorch CUDA runtime so CTranslate2 can use an available NVIDIA GPU without bundling PyTorch.
+- Live preview starts with shorter audio, refreshes more often, and ends a spoken phrase sooner.
+- User-provided shadow-mask artwork is now the app logo.
+
 ## [0.1.0] - 2026-10-29
 
 ### Added
-- SHADOW-6 product identity, original violet-blue companion logo, and Windows icon assets.
-- Original companion logo on the first-run welcome screen, tray icon, dashboard, and Windows executable.
+- SHADOW-6 product identity and Windows icon assets.
+- SHADOW-6 artwork on the first-run welcome screen, tray icon, dashboard, and Windows executable.
 - Hindi-to-Roman-Hinglish conversion using the LiveWhisper/Dakshina pipeline, preserving English text.
 - Offline model benchmark utility for human-reviewed audio/reference CSVs.
 - Source audit, architecture, privacy, and third-party licensing documentation.

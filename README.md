@@ -10,11 +10,13 @@ SHADOW-6 is an offline-first Windows voice typing companion. Press a global shor
 
 This is an early SHADOW-6 derivative of [Eqho](https://github.com/DanielMevit/Eqho), licensed under GNU AGPL-3.0. It retains Eqho's Windows tray app, microphone/audio worker, model-host subprocess, floating overlay, hotkeys, settings dashboard, and text injection. Hindi-script spans are converted to Roman Hinglish with LiveWhisper's Hindi romanization pipeline. English spans are kept intact.
 
-The initial local baseline is faster-whisper large-v3, with the medium model still selectable. SHADOW-6 prefers the user's existing Hugging Face model cache when large-v3 is present. The optional Oriserve Apex Transformers backend has **not** been integrated or benchmarked yet. No model-quality or latency claim is made for SHADOW-6 until it is measured on reference audio.
+The initial local baseline is faster-whisper large-v3, with the medium model still selectable. SHADOW-6 prefers the user's existing Hugging Face model cache when large-v3 is present. The optional Oriserve Apex Transformers backend has **not** been integrated or benchmarked yet. Speech-to-text speed still depends on the model, GPU runtime, and microphone; no accuracy or latency benchmark is claimed.
 
 ## Download and run on Windows
 
 Download the latest **SHADOW-6-portable** ZIP from [GitHub Releases](https://github.com/agent-47-cyber/shadow-6/releases/latest), extract it, and run `SHADOW-6.exe` from the extracted `SHADOW-6` folder. The portable package contains the application runtime and license notices, but not speech-model weights. On first use, connect to the internet so the selected Whisper model can be downloaded (large-v3 is about 3 GB); later transcription runs locally. CUDA is used when a compatible NVIDIA runtime is available; otherwise faster-whisper runs on the CPU. The Windows build is unsigned, so SmartScreen may show a reputation prompt.
+
+Your selected language, model, shortcut, and setup completion are saved in `%APPDATA%\SHADOW-6\settings.json`; setup should only appear on first run. A cached model is loaded once and kept ready while SHADOW-6 runs. Live preview starts after about 0.4 seconds of captured speech and refreshes roughly every 0.35 seconds; the text may change as the sentence continues. A final phrase is committed after about 0.6 seconds of silence. Actual timing varies by hardware and model.
 
 ## Run from source (Windows)
 
@@ -45,7 +47,7 @@ The smoke check uses the cached large-v3 model and stays offline. If that model 
 
 ## Windows packaging
 
-The Windows portable application was built and its packaged `--smoke` check returned exit code 0. The portable output is `dist/SHADOW-6-portable-0.1.0-win-x64.zip` (about 138 MB; it does not include speech model weights). The Inno Setup installer was not built because Inno Setup is not installed. The packaged smoke check was headless; microphone capture and destination insertion remain unverified in the packaged build.
+The Windows portable application is built as an onedir package; it does not include speech model weights. The Inno Setup installer is optional and requires Inno Setup 6. This unsigned build may show a SmartScreen reputation prompt.
 
 ```powershell
 .\packaging\windows\build.ps1

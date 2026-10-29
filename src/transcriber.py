@@ -20,7 +20,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 0.5
+CHUNK_DURATION = 0.2
 # The mic delivers small blocks (50 ms) so the overlay can draw the live
 # waveform; _audio_callback re-assembles them into the same CHUNK_DURATION
 # chunks the worker always got (VAD/partials/flush timing unchanged).
@@ -70,10 +70,11 @@ def downsample_wave(block: np.ndarray, points: int = WAVE_POINTS) -> np.ndarray:
 SILENCE_THRESHOLD = 0.003       # legacy fixed value = upper clamp
 VAD_THRESHOLD_MIN = 0.0009      # never trigger below this (electrical noise)
 VAD_NOISE_MULTIPLIER = 3.5      # speech must be this × the noise floor
-SILENCE_TIMEOUT = 1.2
+SILENCE_TIMEOUT = 0.6
 MIN_PHRASE_DURATION = 0.4
-PARTIAL_INTERVAL = 1.0  # send a partial transcription every N seconds of active speech
-PARTIAL_TAIL_SECONDS = 10.0  # partials re-transcribe at most this much recent audio
+PARTIAL_MIN_AUDIO_SECONDS = 0.4
+PARTIAL_INTERVAL = 0.35  # refresh the live preview several times per second
+PARTIAL_TAIL_SECONDS = 4.0  # keep live inference bounded on long phrases
 SLOW_HINT_S = 6.0  # a final model call slower than this may show the slow-model tip
 STOP_JOIN_TIMEOUT = 5.0  # stop() waits this long for the final flush; anything
                          # slower is dropped (the session is closed) rather than
@@ -570,7 +571,8 @@ class VoiceTranscriber:
 
                     now = time.monotonic()
                     buf_duration = total_samples / SAMPLE_RATE
-                    if buf_duration > 1.0 and (now - last_partial_time) >= PARTIAL_INTERVAL:
+                    if (buf_duration >= PARTIAL_MIN_AUDIO_SECONDS
+                            and (now - last_partial_time) >= PARTIAL_INTERVAL):
                         last_partial_time = now
                         if not self._partials_allowed(session):
                             continue
