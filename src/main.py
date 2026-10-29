@@ -77,6 +77,8 @@ class App:
         self._settings_apply_lock = threading.Lock()  # serialize settings applies
         self._mic_settings_opened = False  # privacy page opened once per run
         self._finishing = False  # a stopped dictation is still being written down
+        self._voice_stop_requested = False
+        self._voice_stop_lock = threading.Lock()
 
         self.transcriber.set_callbacks(
             on_partial=self._on_partial,
@@ -107,9 +109,15 @@ class App:
     def _on_partial(self, text: str) -> None:
         if self._finishing:
             return  # keep "Writing it down…" up until the text is typed
+        if textproc.is_stop_command(text):
+            self._request_voice_stop()
+            return
         self.overlay.update_text(text)
 
     def _on_complete(self, text: str) -> None:
+        if textproc.is_stop_command(text):
+            self._request_voice_stop()
+            return
         if self.settings.voice_commands:
             if textproc.is_delete_command(text):
                 self._handle_delete_command()
@@ -122,6 +130,19 @@ class App:
             full_so_far = textproc.smart_join(self._pending_text)
         if not self._finishing:
             self.overlay.update_text(full_so_far)
+
+    def _request_voice_stop(self) -> None:
+        """Stop dictation from a recognized end-of-phrase command.
+
+        Transcription callbacks run on the audio worker, so dispatch toggle on
+        another thread; deactivation waits for that worker's final flush.
+        """
+        with self._voice_stop_lock:
+            if self._finishing or self._voice_stop_requested or not self.transcriber.is_running():
+                return
+            self._voice_stop_requested = True
+        log.info("Voice stop command recognized")
+        threading.Thread(target=self.deactivate, name="voice-stop-command", daemon=True).start()
 
     def _handle_delete_command(self) -> None:
         """'Delete that': drop the previous utterance — the pending one if
@@ -258,6 +279,8 @@ class App:
             with self._lock:
                 self._target_hwnd = hwnd
                 self._pending_text.clear()
+            with self._voice_stop_lock:
+                self._voice_stop_requested = False
             log.info("Dictation activated (target window: %s)", hwnd)
             self._dictation_start = time.monotonic()
             self.overlay.show(

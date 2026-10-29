@@ -7,6 +7,14 @@ Date format: `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-29
+
+### Added
+- Say “SHADOW-6 stop” or “S-6 stop” at the end of a phrase to end dictation; this works even when optional formatting voice commands are off.
+
+### Fixed
+- Stop commands recognized in the live preview now stop listening promptly and are not inserted as dictated text.
+
 ## [0.1.1] - 2026-10-29
 
 ### Fixed

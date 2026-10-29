@@ -30,6 +30,19 @@ VOICE_COMMANDS = {
 
 DELETE_COMMANDS = {"delete that", "scratch that"}
 
+# Stop-listening is an app control command rather than a text-formatting
+# command, so it is always available (independent of the optional
+# voice_commands setting). Whisper commonly renders the product name as
+# "shadow six", "shadow 6", "s six", or "s6".
+_STOP_PHRASE_TAILS = (
+    ("shadow", "6", "stop"),
+    ("shadow", "six", "stop"),
+    ("s", "6", "stop"),
+    ("s", "six", "stop"),
+    ("ess", "six", "stop"),
+    ("s6", "stop"),
+)
+
 _NO_LEADING_SPACE = {".", ",", "?", "!", ":", ";"}
 
 
@@ -46,6 +59,17 @@ def match_command(text: str):
 
 def is_delete_command(text: str) -> bool:
     return normalize(text) in DELETE_COMMANDS
+
+
+def is_stop_command(text: str) -> bool:
+    """Whether the end of an utterance/preview is a SHADOW-6 stop command.
+
+    Match only at the end so ordinary phrases mentioning the app name don't
+    unexpectedly stop dictation. Punctuation and hyphens are normalized away.
+    """
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return any(len(words) >= len(tail) and tuple(words[-len(tail):]) == tail
+               for tail in _STOP_PHRASE_TAILS)
 
 
 def apply_replacements(text: str, replacements: dict) -> str:

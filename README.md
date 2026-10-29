@@ -31,6 +31,8 @@ python -m venv --system-site-packages .venv
 
 The default shortcut is **Ctrl+Shift+Space**. Click into a text field first. When dictation ends, SHADOW-6 inserts recognized text into the prior target only when its focus checks allow it. Review the text and send it yourself. Roman Hinglish can be changed in **General → Speech → Roman Hinglish**.
 
+While dictating, you can also say **“SHADOW-6 stop”** or **“S-6 stop”** at the end of a phrase to stop listening; the command is removed from the text. Spoken-word recognition is model-based and may need a short pause for the model to recognize the command.
+
 The default recognition model is `large-v3`, and Hindi is the default recognition language. Roman Hinglish conversion is enabled. The medium model is available in **Settings → Models**. Model downloads happen through the existing background model setup flow; the app needs network access only when a selected model is not cached.
 
 ## Logo
