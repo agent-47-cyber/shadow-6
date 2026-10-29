@@ -1,0 +1,713 @@
+"""SHADOW-6 -- always-on dictation app entry point.
+
+Wires together: settings, transcriber, overlay, hotkey, tray, and injector.
+"""
+
+import logging
+import threading
+import time
+import warnings
+from typing import Optional
+
+from . import chime, oskit, textproc
+from .fonts import load_fonts, unload_fonts
+from .history import TranscriptHistory
+from .settings import Settings, VOLUME_DUCK_OPTIONS, CONFIG_DIR
+from .transcriber import VoiceTranscriber
+from .overlay import TranscriptionOverlay
+from .hotkey import HotkeyManager
+from .injector import type_text, get_foreground_window, set_foreground_window, send_backspaces
+from .model_host import _TRANSCRIBE_TIMEOUT
+from .tray import TrayApp
+
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(
+    level=logging.INFO,
+    format=_LOG_FORMAT,
+    datefmt="%H:%M:%S",
+)
+# File log — the packaged exe has no console, so without this, crashes and
+# errors leave no trace at all. Lives next to settings.json.
+try:
+    from logging.handlers import RotatingFileHandler
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        CONFIG_DIR / "shadow6.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8",
+    )
+    _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_file_handler)
+except Exception:
+    pass
+# Silence noisy libraries
+for _quiet in ("PIL", "httpx", "httpcore", "urllib3"):
+    logging.getLogger(_quiet).setLevel(logging.WARNING)
+# huggingface_hub emits a WARNING about missing HF_TOKEN on every download —
+# harmless (downloads work fine without auth) but confusing to users
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
+warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+log = logging.getLogger("shadow6")
+
+# After stop, wait this long for the final transcription before giving up.
+# Only a truly stuck engine hits it: ModelHost.transcribe itself fails after
+# _TRANSCRIBE_TIMEOUT, so a slow PC (5-60 s per call) still gets its text.
+FINISH_TIMEOUT = _TRANSCRIBE_TIMEOUT + 15.0
+WRITING_TEXT = "Writing it down…"
+STILL_WRITING_TEXT = "Still writing your last dictation — one moment."
+TOO_SLOW_TEXT = ("That dictation took too long and was lost. A smaller model "
+                 "in SHADOW-6 → Models is faster on this PC.")
+
+
+class App:
+    """Top-level application controller."""
+
+    def __init__(self) -> None:
+        self.settings = Settings.load()
+        self.transcriber = VoiceTranscriber(self.settings)
+        self.overlay = TranscriptionOverlay(self.settings)
+        self._pending_text: list[str] = []
+        self._lock = threading.Lock()
+        self._target_hwnd: int = 0  # window to paste into
+        self._saved_volume: Optional[float] = None  # for volume ducking
+        self._session_lock = threading.RLock()  # serializes session start/teardown
+        self._session = 0  # transcriber session id of the active dictation
+        self.history = TranscriptHistory()
+        self._dictation_start: float = 0.0
+        self._last_injected: str = ""  # for the "delete that" voice command
+        self._settings_apply_lock = threading.Lock()  # serialize settings applies
+        self._mic_settings_opened = False  # privacy page opened once per run
+        self._finishing = False  # a stopped dictation is still being written down
+
+        self.transcriber.set_callbacks(
+            on_partial=self._on_partial,
+            on_complete=self._on_complete,
+            on_status=self._on_status,
+            on_level=self._on_level,
+            on_waveform=self._on_waveform,
+            on_abort=self._on_abort,
+            on_notice=lambda msg: self.tray.notify(msg),
+        )
+
+        self.hotkey = HotkeyManager(
+            self.settings,
+            on_activate=self.activate,
+            on_deactivate=self.deactivate,
+            on_toggle=self.toggle,  # toggle-mode state authority lives here
+        )
+
+        self.tray = TrayApp(
+            self.settings,
+            on_toggle=self.toggle,
+            on_quit=self.quit,
+            on_settings_changed=self._on_settings_changed,
+        )
+
+    # -- Transcription callbacks -----------------------------------------------
+
+    def _on_partial(self, text: str) -> None:
+        if self._finishing:
+            return  # keep "Writing it down…" up until the text is typed
+        self.overlay.update_text(text)
+
+    def _on_complete(self, text: str) -> None:
+        if self.settings.voice_commands:
+            if textproc.is_delete_command(text):
+                self._handle_delete_command()
+                return
+            command_text = textproc.match_command(text)
+            if command_text is not None:
+                text = command_text
+        with self._lock:
+            self._pending_text.append(text)
+            full_so_far = textproc.smart_join(self._pending_text)
+        if not self._finishing:
+            self.overlay.update_text(full_so_far)
+
+    def _handle_delete_command(self) -> None:
+        """'Delete that': drop the previous utterance — the pending one if
+        dictation is mid-flight, else backspace the last injected text."""
+        with self._lock:
+            if self._pending_text:
+                self._pending_text.pop()
+                remaining = textproc.smart_join(self._pending_text)
+                last_injected = None
+            else:
+                last_injected, self._last_injected = self._last_injected, ""
+                remaining = ""
+        if last_injected:
+            if len(last_injected) <= 400:  # backspacing a novel would take ages
+                send_backspaces(len(last_injected))
+            return
+        self.overlay.update_text(remaining or "Listening...")
+
+    def _on_status(self, message: str) -> None:
+        """Transcriber lifecycle messages (e.g. model finished loading)."""
+        self.overlay.update_text(message)
+
+    def _on_level(self, level: float) -> None:
+        """Live mic level (0..1) for the overlay's audio indicator."""
+        self.overlay.set_level(level)
+
+    def _on_waveform(self, wave) -> None:
+        """Live voice features [loud, tone] per 50 ms block (audio thread) — shape the pill's lines."""
+        self.overlay.set_waveform(wave)
+
+    def _on_abort(self, reason: str, session: int) -> None:
+        """The transcriber worker died mid-session (model-load failure or
+        crash). Run the single teardown path so volume/overlay/tray never
+        stay stuck (F1); the session id lets the teardown ignore aborts that
+        belong to an already-replaced session."""
+        self._teardown_session(session, error=reason)
+
+    # -- Activation control ----------------------------------------------------
+
+    def _mic_unavailable_message(self) -> str:
+        """Plain-words tray message for a mic that can't open (owner rule:
+        no error codes). When Windows is blocking the microphone, also
+        opens the privacy settings page — once per run, not on every
+        hotkey press. The technical error stays in the log only."""
+        kit = oskit.get()
+        blocked = None
+        try:
+            blocked = kit.mic_access_blocked()
+        except Exception:
+            log.debug("Mic privacy check failed", exc_info=True)
+        if blocked:
+            if not self._mic_settings_opened:
+                self._mic_settings_opened = True
+                if kit.open_mic_privacy_settings():
+                    log.info("Opened the Windows microphone privacy settings page.")
+                else:
+                    log.debug("Could not open the microphone privacy settings page.")
+            return ("Windows is blocking the microphone. Turn on microphone "
+                    "access for desktop apps — the settings page is opening now.")
+        return ("No microphone found. Plug one in, or choose another one in "
+                "SHADOW-6 → General → Microphone.")
+
+    def _teardown_session(self, session: Optional[int],
+                          error: Optional[str] = None,
+                          hide_overlay: bool = True) -> None:
+        """The ONE path that ends a dictation session. ALWAYS restores system
+        volume, hides the overlay and resets the tray — on normal stop, mic
+        failure, model-load failure or a worker crash. `session` is the
+        transcriber session this teardown belongs to (None = unconditional);
+        teardowns for an older session are skipped so an abort can never
+        un-duck or hide a NEWER session's UI. A normal stop passes
+        hide_overlay=False: the overlay then shows "Writing it down…" and the
+        finish thread hides it once the text is typed (_end_finishing)."""
+        with self._session_lock:
+            with self._lock:
+                if session is not None and session != self._session:
+                    log.info("Skipping stale session teardown (session %s, current %s)",
+                             session, self._session)
+                    return
+                self._session = 0
+            if error:
+                log.error("Dictation session aborted: %s", error)
+            self._restore_volume()
+            if hide_overlay:
+                self.overlay.hide()
+            self.tray.set_active(False)
+            if error:
+                self.tray.notify(error)
+
+    def _duck_volume(self) -> None:
+        """Silently lower system volume based on user setting."""
+        multiplier = VOLUME_DUCK_OPTIONS.get(self.settings.volume_duck)
+        if multiplier is None:  # "off"
+            return
+        kit = oskit.get()
+        saved = kit.get_volume()
+        if saved is None:  # volume control unavailable on this OS setup
+            return
+        with self._lock:
+            self._saved_volume = saved
+        if multiplier == 0.0:
+            kit.set_mute(True)
+        else:
+            kit.set_volume(saved * multiplier)
+        log.info("Volume ducked: %.0f%% → %s", saved * 100,
+                 "muted" if multiplier == 0.0 else f"{saved * multiplier * 100:.0f}%")
+
+    def _restore_volume(self) -> None:
+        """Silently restore system volume to previous level."""
+        with self._lock:
+            saved = self._saved_volume
+        if saved is None:
+            return
+        kit = oskit.get()
+        kit.set_mute(False)
+        if kit.set_volume(saved):
+            with self._lock:
+                self._saved_volume = None
+            log.info("Volume restored to %.0f%%.", saved * 100)
+
+    def _note_still_writing(self) -> None:
+        """A hotkey press while the last dictation is still being written:
+        never start a second, overlapping dictation (keeps F2 impossible)."""
+        log.info("Hotkey ignored: last dictation still being written")
+        self.overlay.update_text(STILL_WRITING_TEXT)
+        self.tray.notify(STILL_WRITING_TEXT)
+
+    def activate(self) -> None:
+        with self._session_lock:
+            if self._finishing:
+                self._note_still_writing()
+                return
+            hwnd = get_foreground_window()
+            with self._lock:
+                self._target_hwnd = hwnd
+                self._pending_text.clear()
+            log.info("Dictation activated (target window: %s)", hwnd)
+            self._dictation_start = time.monotonic()
+            self.overlay.show(
+                "Listening..." if self.transcriber.is_model_ready() else "Loading model…"
+            )
+            self.tray.set_active(True)
+            # Mic first (recording starts instantly), THEN the chime — blocking,
+            # so it finishes before ducking mutes the output (the old fire-and-
+            # forget blip raced the mute and was sometimes silent). Ducking lands
+            # ~0.3s into dictation, which is inaudible in practice.
+            self.transcriber.start()
+            session = self.transcriber.current_session()
+            with self._lock:
+                self._session = session
+            if self.settings.sound_feedback:
+                chime.play_start(blocking=True)
+            self._duck_volume()
+            mic_error = self.transcriber.consume_mic_error()
+            if mic_error:
+                if not self.transcriber.is_running():
+                    log.error("No microphone available: %s", mic_error)
+                    self._teardown_session(None, error=self._mic_unavailable_message())
+                else:
+                    self.tray.notify("Selected mic unavailable, using default microphone.")
+
+    def deactivate(self) -> None:
+        with self._session_lock:
+            if self._finishing:
+                return  # e.g. hold-key release after a refused press
+            log.info("Dictation deactivated")
+            worker = self.transcriber.request_stop()
+            # Volume and tray reset now; the overlay stays up until the text
+            # is typed (a slow PC needs 5-60 s for the final transcription).
+            self._teardown_session(None, hide_overlay=False)
+            self._finishing = True
+            self.overlay.update_text(WRITING_TEXT)
+        if self.settings.sound_feedback:
+            chime.play_stop()  # after restore, so it's audible
+        # Wait + inject on a daemon thread, never on the hotkey thread (a
+        # blocked hotkey thread queues key presses that fire later).
+        try:
+            threading.Thread(target=self._finish_dictation, args=(worker,),
+                             name="finish-dictation", daemon=True).start()
+        except Exception:
+            log.exception("Could not start the finish thread")
+            self._finish_dictation(worker, timeout=0.0)
+
+    def _finish_dictation(self, worker, timeout: Optional[float] = None) -> None:
+        """Wait for the worker's final flush, then type the text into the
+        window the user dictated into. A stuck engine closes the session
+        (its late result is dropped) and tells the user. Always ends with the
+        overlay hidden and the finishing flag cleared."""
+        error = None
+        try:
+            done = self.transcriber.finish_stop(
+                worker, FINISH_TIMEOUT if timeout is None else timeout)
+            if done:
+                self._inject_pending()
+            else:
+                log.warning("Final transcription still running after %.0fs — dropped",
+                            FINISH_TIMEOUT if timeout is None else timeout)
+                error = TOO_SLOW_TEXT
+        except Exception:
+            log.exception("Finishing the dictation failed")
+            error = "Something went wrong while writing that dictation down."
+        finally:
+            self._end_finishing(error)
+
+    def _end_finishing(self, error: Optional[str]) -> None:
+        with self._session_lock:
+            with self._lock:
+                self._pending_text.clear()
+            self.overlay.hide()
+            self._finishing = False
+        if error:
+            self.tray.notify(error)
+
+    def _inject_pending(self) -> None:
+        with self._lock:
+            full_text = textproc.smart_join(self._pending_text)
+            self._pending_text.clear()
+            target_hwnd = self._target_hwnd
+
+        full_text = textproc.apply_replacements(full_text, self.settings.replacements)
+        if self.settings.format_cleanup:
+            full_text = textproc.clean_text(full_text, remove_fillers=self.settings.remove_fillers)
+
+        if full_text:
+            # Per-app paste rule overrides the default (some apps mishandle
+            # clipboard paste and need simulated typing, or vice-versa).
+            use_clipboard = self.settings.auto_paste
+            if target_hwnd and self.settings.paste_rules:
+                exe = oskit.get().get_window_process_name(target_hwnd)
+                if exe:
+                    rule = self.settings.paste_rules.get(exe.lower())
+                    if rule == "typing":
+                        use_clipboard = False
+                    elif rule == "clipboard":
+                        use_clipboard = True
+
+            time.sleep(0.4)  # wait for modifier keys to fully release
+            if target_hwnd:
+                set_foreground_window(target_hwnd)
+                time.sleep(0.15)  # let the window come to focus
+            type_text(full_text, use_clipboard=use_clipboard)
+            # Length only — never the transcript itself (F10).
+            log.info("Injected %d chars", len(full_text))
+            self._last_injected = full_text
+            if self.settings.history_enabled:
+                duration = time.monotonic() - self._dictation_start if self._dictation_start else 0.0
+                self.history.append(
+                    full_text, duration=duration,
+                    model=self.settings.model_size, lang=self.settings.language,
+                )
+
+    def toggle(self) -> None:
+        if self._finishing:
+            self._note_still_writing()
+            return
+        if self.transcriber.is_running():
+            self.deactivate()
+        else:
+            self.activate()
+
+    # -- Settings change -------------------------------------------------------
+
+    def _on_settings_changed(self, reload_model: bool = False) -> None:
+        """Apply settings changes on a background thread — callers include the
+        pystray menu thread and dashboard callbacks, and a model reload (or
+        download) must never block either."""
+        def _apply() -> None:
+            with self._settings_apply_lock:
+                try:
+                    log.info("Settings changed, re-registering hotkey%s",
+                             " and reloading model" if reload_model else "")
+                    self.hotkey.unregister()
+                    self.hotkey.register()
+                    self.tray.set_active(self._is_active())
+                    if reload_model:
+                        # Reconcile the inference engine first (no-op unless the
+                        # engine_backend setting changed). A switch respawns the
+                        # model-host child on the new backend, so skip the
+                        # redundant reload_model when that already happened.
+                        if not self.transcriber.set_engine(self.settings.engine_backend):
+                            self.transcriber.reload_model()
+                        # Eagerly load (and download, with tray notifications) the
+                        # new model so the next dictation starts instantly.
+                        self._preload_model()
+                except Exception:
+                    log.exception("Applying settings change failed")
+
+        threading.Thread(target=_apply, daemon=True).start()
+
+    def _is_active(self) -> bool:
+        return self.transcriber.is_running()
+
+    # -- Lifecycle -------------------------------------------------------------
+
+    def run(self) -> None:
+        from .watchdog import start as start_watchdog
+        start_watchdog()
+        load_fonts()
+        log.info("SHADOW-6 starting...")
+        log.info(
+            "Model: %s | Hotkey: %s (%s mode)",
+            self.settings.model_size,
+            self.settings.hotkey,
+            self.settings.hotkey_mode,
+        )
+
+        self.overlay.start()
+        self.hotkey.register()
+
+        from .ui.dashboard import set_onboarding_callback
+        set_onboarding_callback(self._on_onboarding_finished)
+        if self.settings.onboarding_done:
+            threading.Thread(target=self._preload_model, daemon=True).start()
+        else:
+            # First launch: download nothing until the user agrees in setup.
+            log.info("First launch: opening first-time setup.")
+            self._open_onboarding()
+
+        # When launched with --open-dashboard --tab=<name>, reopen the
+        # dashboard to that tab once the app is up.
+        import sys
+        if "--open-dashboard" in sys.argv:
+            tab = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--tab=")), None)
+            threading.Timer(1.2, lambda: self._open_dashboard_startup(tab)).start()
+
+        self.tray.run()
+
+    def _open_onboarding(self) -> None:
+        try:
+            from .ui import open_dashboard
+            open_dashboard(self.settings, self._on_settings_changed,
+                           onboarding=True)
+        except Exception as e:
+            log.error("Opening first-time setup failed: %s", e)
+
+    def _on_onboarding_finished(self, model_changed: bool = False) -> None:
+        """Setup finished or was skipped (runs on the dashboard thread —
+        never block it). Loads the model only if it is already downloaded
+        ("Download now"); after "Later" the first dictation downloads it."""
+        def _run() -> None:
+            try:
+                if model_changed:
+                    self.transcriber.reload_model()  # marks stale only
+                from . import modelstore
+                model = self.settings.model_size
+                while modelstore.is_downloading(model):
+                    time.sleep(1.0)
+                if self._model_is_cached():
+                    self._preload_model()
+                else:
+                    log.info("Setup done; model not downloaded yet — it "
+                             "downloads on the first dictation.")
+            except Exception:
+                log.exception("Post-setup preload failed")
+        threading.Thread(target=_run, name="post-setup-preload", daemon=True).start()
+
+    def _open_dashboard_startup(self, tab) -> None:
+        try:
+            from .ui import open_dashboard
+            open_dashboard(self.settings, self._on_settings_changed,
+                           initial_tab=tab)
+        except Exception as e:
+            log.error("Startup dashboard open failed: %s", e)
+
+    def open_dashboard(self) -> None:
+        """Open the dashboard — the same call the tray menu makes; also the
+        action when a second launch asks this instance to show itself."""
+        try:
+            from .ui import open_dashboard
+            open_dashboard(self.settings, self._on_settings_changed)
+        except Exception as e:
+            log.error("Opening the dashboard failed: %s", e)
+
+    def _model_is_cached(self) -> bool:
+        """Check if the current model has already been downloaded."""
+        from .settings import is_model_cached
+        return is_model_cached(self.settings, self.settings.model_size)
+
+    def _preload_model(self) -> None:
+        try:
+            needs_download = not self._model_is_cached()
+            if needs_download:
+                log.info("Model not cached, downloading (this may take a few minutes)...")
+                self.tray.notify(f"Downloading model '{self.settings.model_size}'... this may take a few minutes.")
+            else:
+                log.info("Pre-loading model from cache...")
+            self.transcriber._ensure_model()
+            log.info("Model pre-loaded and ready.")
+            if needs_download:
+                self.tray.notify("Model downloaded and ready!")
+        except Exception as e:
+            log.error("Failed to pre-load model: %s", e)
+            from .transcriber import LowMemoryLoadError
+            self.tray.notify(str(e) if isinstance(e, LowMemoryLoadError)
+                             else f"Failed to load model: {e}")
+
+    def quit(self) -> None:
+        log.info("Shutting down...")
+        # Close dashboard first to avoid tkinter Variable.__del__ errors
+        from .ui import shutdown_dashboard
+        shutdown_dashboard()
+        self._restore_volume()  # always unmute on exit
+        self.hotkey.unregister()
+        self.transcriber.shutdown()
+        self.overlay.shutdown()
+        self.settings.save()
+        unload_fonts()
+
+
+def _emergency_unmute() -> None:
+    """Last resort: unmute system audio on any exit."""
+    try:
+        oskit.get().set_mute(False)
+    except Exception:
+        pass
+
+
+def _suppress_tk_variable_del() -> None:
+    """Patch tkinter Variable.__del__ to suppress RuntimeError on shutdown.
+
+    When the dashboard thread's Tcl interpreter is gone, garbage-collected
+    StringVar/BooleanVar objects raise 'main thread is not in main loop'.
+    This is harmless — suppress it to avoid log spam.
+    """
+    try:
+        import tkinter as tk
+        _original_del = tk.Variable.__del__
+
+        def _safe_del(self):
+            try:
+                _original_del(self)
+            except (RuntimeError, AttributeError, TypeError):
+                pass
+
+        tk.Variable.__del__ = _safe_del
+    except Exception:
+        pass
+
+
+_single_instance_socket = None
+SINGLE_INSTANCE_PORT = 48318
+
+
+def _acquire_single_instance(port: int = SINGLE_INSTANCE_PORT) -> bool:
+    """One SHADOW-6 per machine. Two instances both hook the hotkey, fight over
+    the mic, and stack models into VRAM until CUDA loads hang (the model-
+    switch 'freeze'). A bound localhost port is the cross-platform lock."""
+    global _single_instance_socket
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        _single_instance_socket = s  # held for the process lifetime
+        return True
+    except OSError:
+        return False
+
+
+def _start_instance_listener(sock, on_show) -> None:
+    """Serve the single-instance lock socket on a daemon thread. A second
+    launch sends 'show' to ask the running SHADOW-6 to open its dashboard;
+    anything else is ignored. Each connection is handled on its own short-
+    lived thread (at most 4 at once, 0.5 s to speak), so a silent local
+    client can't hold up a real second launch. Nothing here may ever crash
+    the app — errors are logged at debug level."""
+    slots = threading.BoundedSemaphore(4)
+
+    def _handle(conn):
+        show = False
+        try:
+            conn.settimeout(0.5)  # a real second launch sends at once
+            data = conn.recv(64)
+            if data == b"show":
+                conn.sendall(b"ok")  # the asker waits for this (an old SHADOW-6 never replies)
+                show = True
+            else:
+                log.debug("Single-instance: ignored message %r", data)
+        except Exception:
+            log.debug("Single-instance connection error", exc_info=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            slots.release()  # free the slot BEFORE on_show: a stuck callback can't starve the listener
+        if show:
+            try:
+                on_show()  # reuses an open dashboard window, never stacks them
+            except Exception:
+                log.debug("Single-instance 'show' callback failed", exc_info=True)
+
+    def _serve():
+        while True:
+            try:
+                conn, _addr = sock.accept()
+            except OSError:
+                return  # socket closed (shutdown)
+            # Busy: wait for a slot (silent clients are cut off after 0.5 s);
+            # only drop after 1 s, so a real second launch still gets through.
+            if not slots.acquire(timeout=1.0):
+                conn.close()
+                continue
+            try:
+                threading.Thread(target=_handle, args=(conn,), daemon=True,
+                                 name="single-instance-conn").start()
+            except Exception:  # can't start a thread: give the slot back
+                slots.release()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_serve, daemon=True, name="single-instance").start()
+
+
+def _request_show(port: int = SINGLE_INSTANCE_PORT,
+                  timeout: float = 2.0) -> bool:
+    """Second instance: ask the running SHADOW-6 to show its dashboard. True
+    when the message was delivered; False when nobody answers (old or
+    frozen instance) within `timeout` seconds."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall(b"show")
+            # Only an SHADOW-6 with this listener replies; an older version (or
+            # anything else on the port) accepts the connection but stays silent.
+            return s.recv(8) == b"ok"
+    except OSError:
+        return False
+
+
+def _log_unhandled_exceptions() -> None:
+    """Route unhandled exceptions (main + threads) into the log file."""
+    import sys
+
+    def _hook(exc_type, exc, tb):
+        log.critical("UNHANDLED EXCEPTION", exc_info=(exc_type, exc, tb))
+
+    def _thread_hook(args):
+        name = args.thread.name if args.thread else "?"
+        log.critical("UNHANDLED THREAD EXCEPTION in %s", name,
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _hook
+    threading.excepthook = _thread_hook
+
+
+def main() -> None:
+    if not _acquire_single_instance():
+        # SHADOW-6 is already running: ask it to show itself, then exit quietly.
+        if _request_show():
+            log.info("SHADOW-6 is already running — asked it to open its window; "
+                     "this instance exits.")
+            return
+        log.error("SHADOW-6 is already running and did not answer — this instance "
+                  "exits. Check the system tray (and Task Manager for frozen "
+                  "instances).")
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(
+                "SHADOW-6", "SHADOW-6 is already running. Look for its icon near the clock.")
+            root.destroy()
+        except Exception:
+            pass
+        return
+
+    import atexit
+    atexit.register(_emergency_unmute)
+    _log_unhandled_exceptions()
+    _suppress_tk_variable_del()
+
+    app = App()
+    # A second launch sends 'show' on the lock socket — open the dashboard.
+    if _single_instance_socket is not None:
+        _start_instance_listener(_single_instance_socket, app.open_dashboard)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        app.quit()
+    finally:
+        _emergency_unmute()
+
+
+if __name__ == "__main__":
+    main()

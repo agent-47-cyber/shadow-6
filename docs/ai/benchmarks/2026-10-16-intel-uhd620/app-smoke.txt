@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "steps": {
+    "settings": "ok",
+    "audio_devices": 12,
+    "textproc": "ok",
+    "history": "ok",
+    "model_load": "ok",
+    "transcribe_silence": "ok"
+  },
+  "version": "0.8.8",
+  "model_dir": "KIT\\models",
+  "silence_text": "[BLANK_AUDIO]"
+}

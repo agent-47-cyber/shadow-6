@@ -1,0 +1,21 @@
+# Eqho dependencies
+faster-whisper>=1.2.1
+sounddevice
+numpy
+platformdirs
+pystray
+Pillow
+pynput
+pyperclip
+# customtkinter 6.0 changed internals Eqho uses (_parent_canvas, _fg_color, ...) — stay on 5.x
+customtkinter>=5.2.0,<6
+
+# Windows-only
+keyboard ; sys_platform == "win32"
+pycaw ; sys_platform == "win32"
+
+# Optional: whisper.cpp backend (AMD/Intel Vulkan, or CPU). NOT installed by
+# default — it needs a native build, and the app runs fine without it
+# (engine_backend "auto" uses faster-whisper). For GPU/Vulkan on Windows, install
+# the self-contained wheel (build it with tools/mkwheel.py — see TODO.md); the
+# PyInstaller spec then bundles it automatically. CPU-only: pip install pywhispercpp.

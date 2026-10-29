@@ -1,0 +1,538 @@
+"""User preferences persisted to a JSON config file."""
+
+import json
+import logging
+import math
+import os
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+
+import platformdirs
+
+log = logging.getLogger(__name__)
+
+# Config lives in a SHADOW-6-specific platform-native config dir. EQHO_CONFIG_DIR
+# remains recognized for upstream's test suite; SHADOW6_CONFIG_DIR is the
+# app-facing override. We intentionally do not reuse upstream personal settings.
+# overrides it so tests/tools can run against an isolated config dir and
+# never touch the owner's real settings, history or logs (EQ-TESTE2E).
+def _resolve_config_dir() -> Path:
+    env_dir = os.environ.get("SHADOW6_CONFIG_DIR") or os.environ.get("EQHO_CONFIG_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path(platformdirs.user_config_dir("SHADOW-6", appauthor=False, roaming=True))
+
+
+CONFIG_DIR = _resolve_config_dir()
+CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+# Models live in the platform cache folder unless the user picks a folder
+# (`model_dir`).
+DEFAULT_MODEL_DIR = Path(platformdirs.user_cache_dir("SHADOW-6", appauthor=False)) / "models"
+
+
+def _existing_hf_model_cache() -> Optional[Path]:
+    """Reuse a standard Hugging Face cache when the requested baseline exists."""
+    candidates = []
+    if os.environ.get("HF_HUB_CACHE"):
+        candidates.append(Path(os.environ["HF_HUB_CACHE"]))
+    if os.environ.get("HF_HOME"):
+        candidates.append(Path(os.environ["HF_HOME"]) / "hub")
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+    for candidate in candidates:
+        if (candidate / "models--Systran--faster-whisper-large-v3").is_dir():
+            return candidate
+    return None
+
+WHISPER_MODELS = {
+    "distil-large-v3": "Distil Large v3 (~1.5 GB, English-optimized, recommended)",
+    "distil-medium.en": "Distil Medium EN (~750 MB, fast English)",
+    "distil-small.en": "Distil Small EN (~330 MB, fastest English)",
+    "large-v3-turbo": "Large v3 Turbo (~1.6 GB, multilingual, near-large accuracy)",
+    "medium": "Medium (~1.5 GB, multilingual)",
+    "small": "Small (~950 MB, multilingual)",
+    "base": "Base (~300 MB, multilingual)",
+    "tiny": "Tiny (~150 MB, fastest, least accurate)",
+    "large-v3": "Large v3 (~3.1 GB, highest accuracy)",
+}
+
+# Whisper understands ~99 languages, but its accuracy is wildly uneven across
+# them — so SHADOW-6 exposes ALL of them in three honesty tiers instead of either
+# hiding them or overselling them:
+#   tuned        — tested in SHADOW-6; dictation-grade accuracy
+#   strong       — excellent published Whisper accuracy; lightly tested here
+#   experimental — Whisper knows them, but word-error rates vary a lot
+#                  (some exceed 40%); expect rough output
+# Tier placement reflects measured accuracy, nothing else.
+LANGUAGE_TIERS: dict[str, dict[str, str]] = {
+    "tuned": {
+        "en": "English",
+        "es": "Spanish",
+        "zh": "Mandarin",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "vi": "Vietnamese",
+        "ar": "Arabic",
+        "uk": "Ukrainian",
+        "fr": "French",
+        "de": "German",
+        "pt": "Portuguese",
+        "ru": "Russian",
+        "it": "Italian",
+    },
+    "strong": {
+        "nl": "Dutch",
+        "pl": "Polish",
+        "tr": "Turkish",
+        "sv": "Swedish",
+        "da": "Danish",
+        "no": "Norwegian",
+        "fi": "Finnish",
+        "cs": "Czech",
+        "ro": "Romanian",
+        "hu": "Hungarian",
+        "el": "Greek",
+        "bg": "Bulgarian",
+        "hr": "Croatian",
+        "sk": "Slovak",
+        "ca": "Catalan",
+        "hi": "Hindi",
+        "id": "Indonesian",
+        "ms": "Malay",
+        "th": "Thai",
+        "he": "Hebrew",
+    },
+    "experimental": {
+        "af": "Afrikaans",
+        "sq": "Albanian",
+        "am": "Amharic",
+        "hy": "Armenian",
+        "as": "Assamese",
+        "az": "Azerbaijani",
+        "ba": "Bashkir",
+        "eu": "Basque",
+        "be": "Belarusian",
+        "bn": "Bengali",
+        "bs": "Bosnian",
+        "br": "Breton",
+        "my": "Burmese",
+        "et": "Estonian",
+        "fo": "Faroese",
+        "gl": "Galician",
+        "ka": "Georgian",
+        "gu": "Gujarati",
+        "ht": "Haitian Creole",
+        "ha": "Hausa",
+        "haw": "Hawaiian",
+        "is": "Icelandic",
+        "jw": "Javanese",
+        "kn": "Kannada",
+        "kk": "Kazakh",
+        "km": "Khmer",
+        "lo": "Lao",
+        "la": "Latin",
+        "lv": "Latvian",
+        "ln": "Lingala",
+        "lt": "Lithuanian",
+        "lb": "Luxembourgish",
+        "mk": "Macedonian",
+        "mg": "Malagasy",
+        "ml": "Malayalam",
+        "mt": "Maltese",
+        "mi": "Māori",
+        "mr": "Marathi",
+        "mn": "Mongolian",
+        "ne": "Nepali",
+        "nn": "Norwegian Nynorsk",
+        "oc": "Occitan",
+        "ps": "Pashto",
+        "fa": "Persian",
+        "pa": "Punjabi",
+        "sa": "Sanskrit",
+        "sr": "Serbian",
+        "sn": "Shona",
+        "sd": "Sindhi",
+        "si": "Sinhala",
+        "sl": "Slovenian",
+        "so": "Somali",
+        "su": "Sundanese",
+        "sw": "Swahili",
+        "tl": "Tagalog",
+        "tg": "Tajik",
+        "ta": "Tamil",
+        "tt": "Tatar",
+        "te": "Telugu",
+        "bo": "Tibetan",
+        "tk": "Turkmen",
+        "ur": "Urdu",
+        "uz": "Uzbek",
+        "cy": "Welsh",
+        "yi": "Yiddish",
+        "yo": "Yoruba",
+    },
+}
+
+# Flat superset (code → label): validation, lookups, and backward compat.
+SUPPORTED_LANGUAGES = {
+    code: name for tier in LANGUAGE_TIERS.values() for code, name in tier.items()
+}
+
+
+def is_english_only_model(model_key: str) -> bool:
+    """Distil and .en models transcribe English only — anything else in,
+    garbage out. Used to warn when the language and model disagree."""
+    return model_key.startswith("distil") or model_key.endswith(".en")
+
+HOTKEY_MODES = ("toggle", "hold")
+
+VOLUME_DUCK_OPTIONS = {
+    "off": None,
+    "50%": 0.5,
+    "25%": 0.25,
+    "10%": 0.10,
+    "mute": 0.0,
+}
+
+OVERLAY_POSITIONS = [
+    "bottom-center",
+    "top-center",
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+]
+
+
+def _coerce_value(val: object, default_val: object) -> object:
+    """Coerce val to match default_val's type (bool, int, float, str, dict).
+    If coercion is impossible, returns default_val.
+    """
+    if default_val is None:
+        if val is None or isinstance(val, bool):
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            try:
+                return int(val)
+            except (ValueError, OverflowError):
+                return None
+        if isinstance(val, str):
+            try:
+                return int(val.strip())
+            except ValueError:
+                return None
+        return None
+
+    # bool must be checked before int because bool subclasses int in Python
+    if isinstance(default_val, bool):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            if val == 1:
+                return True
+            if val == 0:
+                return False
+            return default_val
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("true", "1", "yes", "on"):
+                return True
+            if s in ("false", "0", "no", "off"):
+                return False
+            return default_val
+        return default_val
+
+    if isinstance(default_val, int):
+        if isinstance(val, bool):
+            return default_val
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            try:
+                return int(val)
+            except (ValueError, OverflowError):
+                return default_val
+        if isinstance(val, str):
+            try:
+                return int(val.strip())
+            except ValueError:
+                try:
+                    f = float(val.strip())
+                    if math.isnan(f) or math.isinf(f):
+                        return default_val
+                    return int(f)
+                except (ValueError, OverflowError):
+                    return default_val
+        return default_val
+
+    if isinstance(default_val, float):
+        if isinstance(val, bool):
+            return default_val
+        if isinstance(val, (int, float)):
+            f = float(val)
+            if math.isnan(f) or math.isinf(f):
+                return default_val
+            return f
+        if isinstance(val, str):
+            try:
+                f = float(val.strip())
+                if math.isnan(f) or math.isinf(f):
+                    return default_val
+                return f
+            except (ValueError, OverflowError):
+                return default_val
+        return default_val
+
+    if isinstance(default_val, str):
+        if isinstance(val, str):
+            return val
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return str(val)
+        return default_val
+
+    if isinstance(default_val, dict):
+        if isinstance(val, dict):
+            return val
+        return default_val
+
+    if isinstance(val, type(default_val)):
+        return val
+    return default_val
+
+
+@dataclass
+class Settings:
+    language: str = "hi"
+    hotkey: str = "ctrl+shift+space"
+    hotkey_mode: str = "toggle"  # "toggle" or "hold"
+    hotkey_backend: str = "auto"  # "auto" (keyboard on Windows, pynput elsewhere), "keyboard", "pynput"
+    model_size: str = "large-v3"
+    roman_hinglish: bool = True
+    model_dir: str = ""  # empty = resolve_model_dir() uses the platform cache
+    audio_device: Optional[int] = None  # None = system default input device
+    auto_paste: bool = True  # paste via clipboard vs simulated keystrokes
+    overlay_enabled: bool = True
+    overlay_opacity: float = 0.85
+    overlay_font_size: int = 14
+    overlay_position: str = "bottom-center"
+    overlay_show_level: bool = True  # audio-level line at the overlay bottom
+    overlay_pill_scale: float = 0.8      # pill size, 1.0 = 280x51 (0.6..1.4)
+    overlay_panel_opacity: float = 0.85  # text box above the pill; overlay_opacity = the pill
+    volume_duck: str = "off"  # "off", "50%", "25%", "10%", "mute" — asked during first-time setup
+    start_with_windows: bool = False
+    theme: str = "dark"  # "dark", "light", "system"
+    ui_scale: float = 1.25  # dashboard zoom factor (1.0–2.0)
+    # Local features (v0.5.0)
+    history_enabled: bool = False    # privacy-first: transcript history is opt-in
+    initial_prompt: str = ""         # custom vocabulary bias for Whisper
+    replacements: dict = field(default_factory=dict)  # text substitutions
+    voice_commands: bool = False     # "new line", "period", "delete that", …
+    sound_feedback: bool = True      # start/stop chime
+    format_cleanup: bool = True      # light-touch casing/spacing cleanup
+    remove_fillers: bool = False     # strip "um"/"uh"/… (opt-in sub-toggle)
+    engine_backend: str = "auto"     # "auto" | "faster-whisper" (NVIDIA/CPU) | "whisper.cpp" (AMD/Intel Vulkan, CPU)
+    vad_sensitivity: float = 1.0     # mic sensitivity 0.5 (needs louder) .. 2.0 (picks up quiet)
+    paste_rules: dict = field(default_factory=dict)  # exe name (lower) -> "clipboard"|"typing"
+    onboarding_done: bool = False    # first-time setup finished or skipped (EQ-ONBOARD)
+    slow_hint_shown_for: str = ""    # model key the "slow on this PC" tip was shown for (EQ-SLOWHINT)
+
+    # runtime-only (not persisted)
+    _listeners: list = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        if not hasattr(self, "_lock"):
+            self._lock = threading.Lock()
+
+    def __deepcopy__(self, memo: dict) -> "Settings":
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            if k == "_lock":
+                setattr(result, k, threading.Lock())
+            else:
+                setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
+    def resolve_model_dir(self) -> Path:
+        """Directory Whisper models are cached in."""
+        if self.model_dir:
+            return Path(self.model_dir)
+        return _existing_hf_model_cache() or DEFAULT_MODEL_DIR
+
+    def save(self) -> None:
+        if not hasattr(self, "_lock"):
+            self._lock = threading.Lock()
+        with self._lock:
+            config_dir = CONFIG_FILE.parent
+            try:
+                config_dir.mkdir(parents=True, exist_ok=True)
+                data = asdict(self)
+                data.pop("_listeners", None)
+                content = json.dumps(data, indent=2)
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=config_dir,
+                        prefix="settings_",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as f:
+                        tmp_path = Path(f.name)
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    # Retry os.replace a few times with a short growing pause
+                    # (up to ~10 tries over ~1.5 s). On Windows, os.replace
+                    # fails with PermissionError / WinError 5 or 32 if another
+                    # handle has settings.json open.
+                    for attempt in range(10):
+                        try:
+                            os.replace(tmp_path, CONFIG_FILE)
+                            tmp_path = None
+                            break
+                        except OSError as e:
+                            if attempt < 9:
+                                time.sleep(0.02 * (1.5 ** attempt))
+                            else:
+                                log.warning(
+                                    "Could not save settings to %s after retries: %s",
+                                    CONFIG_FILE,
+                                    e,
+                                )
+                finally:
+                    if tmp_path is not None and tmp_path.exists():
+                        for _ in range(3):
+                            try:
+                                tmp_path.unlink()
+                                break
+                            except OSError:
+                                time.sleep(0.05)
+            except Exception as e:
+                log.warning("Failed to save settings to %s: %s", CONFIG_FILE, e)
+
+    @classmethod
+    def load(cls) -> "Settings":
+        settings = None
+        if CONFIG_FILE.exists():
+            bad_file = CONFIG_FILE.with_name(CONFIG_FILE.name + ".bad")
+            is_corrupt = False
+            data = None
+            try:
+                raw_text = CONFIG_FILE.read_text(encoding="utf-8-sig")  # tolerate a BOM
+                data = json.loads(raw_text)
+                if not isinstance(data, dict):
+                    is_corrupt = True
+            except Exception as e:
+                log.warning("Could not read settings from %s: %s", CONFIG_FILE, e)
+                is_corrupt = True
+
+            if is_corrupt:
+                try:
+                    os.replace(CONFIG_FILE, bad_file)
+                    log.warning("Corrupted settings file moved to %s; using defaults.", bad_file)
+                except Exception as e:
+                    log.warning("Could not rename corrupted settings file %s to %s: %s", CONFIG_FILE, bad_file, e)
+                settings = cls(onboarding_done=True)  # not a fresh install
+            else:
+                try:
+                    defaults = cls()
+                    clean_data = {}
+                    for k, v in data.items():
+                        if k not in cls.__dataclass_fields__ or k == "_listeners":
+                            continue
+                        default_val = getattr(defaults, k)
+                        clean_data[k] = _coerce_value(v, default_val)
+                    # Upgrading users (a settings.json from before first-time
+                    # setup existed) never see setup, and keep the old
+                    # volume-duck default they were running with.
+                    clean_data.setdefault("onboarding_done", True)
+                    clean_data.setdefault("volume_duck", "mute")
+                    # Before EQ-PILLOPTS one opacity drove the pill AND the
+                    # text box: keep the box looking the same for them.
+                    if "overlay_panel_opacity" not in clean_data and "overlay_opacity" in clean_data:
+                        clean_data["overlay_panel_opacity"] = clean_data["overlay_opacity"]
+                    for key, lo, hi in (("overlay_pill_scale", 0.6, 1.4),
+                                        ("overlay_panel_opacity", 0.3, 1.0),
+                                        ("overlay_opacity", 0.3, 1.0)):
+                        if key in clean_data:
+                            clean_data[key] = min(hi, max(lo, float(clean_data[key])))
+                    settings = cls(**clean_data)
+                except Exception as e:
+                    log.warning("Error constructing Settings from %s: %s", CONFIG_FILE, e)
+                    try:
+                        os.replace(CONFIG_FILE, bad_file)
+                    except Exception:
+                        pass
+                    settings = cls(onboarding_done=True)
+
+        if settings is None:
+            settings = cls()
+
+        return settings
+
+    def add_listener(self, callback) -> None:
+        self._listeners.append(callback)
+
+    def notify(self) -> None:
+        for cb in self._listeners:
+            cb(self)
+
+
+_cache_check_memo: dict = {}
+
+
+def is_model_cached(settings: "Settings", model_key: str) -> bool:
+    """True if the given Whisper model is already downloaded to the cache dir.
+
+    Authoritative check: ask faster-whisper itself with local_files_only=True
+    (no network). The old hand-built path list missed the distil models'
+    actual repo naming (faster-DISTIL-whisper-*), which made downloaded distil
+    models look absent and disabled their Select button.
+    Results are memoized for 5 s — the Models tab asks 9× per build.
+    """
+    from .model_host import resolve_backend  # inside: avoids an import cycle
+    engine = resolve_backend(settings.engine_backend)
+    memo_key = (engine, str(settings.resolve_model_dir()), model_key)
+    memo = _cache_check_memo.get(memo_key)
+    if memo and time.monotonic() - memo[1] < 5.0:
+        return memo[0]
+    result = _is_model_cached_uncached(settings, model_key, engine)
+    _cache_check_memo[memo_key] = (result, time.monotonic())
+    return result
+
+
+def _is_model_cached_uncached(settings: "Settings", model_key: str,
+                              engine: str = "faster-whisper") -> bool:
+    cache_dir = settings.resolve_model_dir()
+    if engine == "whisper.cpp":
+        from .model_host import whispercpp_model_path
+        return whispercpp_model_path(cache_dir, model_key).is_file()
+    try:
+        try:
+            from faster_whisper import download_model
+        except ImportError:
+            from faster_whisper.utils import download_model
+        download_model(model_key, local_files_only=True, cache_dir=str(cache_dir))
+        return True
+    except Exception:
+        pass
+    # Fallback path probes (also covers direct model folders)
+    for candidate in (
+        cache_dir / model_key,
+        cache_dir / f"models--Systran--faster-whisper-{model_key}",
+        cache_dir / f"models--Systran--faster-distil-whisper-{model_key.removeprefix('distil-')}",
+        cache_dir / "huggingface" / f"models--Systran--faster-whisper-{model_key}",
+    ):
+        if candidate.exists():
+            return True
+    return False

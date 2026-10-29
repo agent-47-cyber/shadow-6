@@ -1,0 +1,210 @@
+"""History tab: browse, search, copy, delete, and export past dictations."""
+
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import customtkinter as ctk
+
+from ...history import TranscriptHistory
+from ...theme import SPACING, RADIUS_SM, font
+from ..layout import EDGE, TabBase
+from ..widgets import auto_wrap_label, ghost_button, secondary_button
+
+log = logging.getLogger(__name__)
+
+_PAGE_SIZE = 20
+
+_PERIODS = ("All time", "Today", "Yesterday", "Last 7 days", "Last 30 days")
+
+
+class HistoryTab(TabBase):
+    KEY = "history"
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._history = TranscriptHistory()
+        self._search_entry = None
+        self._period_var = None
+        self._list_frame = None
+        self._search_job = None
+        self._shown = _PAGE_SIZE
+
+    def build(self, tab) -> None:
+
+        # Toolbar: search (text or date) + period filter + export + clear
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        # Same top inset as the other sections (their section labels sit
+        # at pady lg) so all three pages start at an identical height.
+        bar.pack(fill="x", padx=EDGE, pady=(SPACING["lg"], SPACING["xs"]))
+
+        # No textvariable: CTkEntry silently DISABLES its placeholder when
+        # one is attached — that's why the grey hint text never showed.
+        search = ctk.CTkEntry(
+            bar,
+            placeholder_text="Search transcripts — keywords or a date like 2026-07-14…",
+            height=30, corner_radius=RADIUS_SM,
+            font=font("sm"),
+            fg_color=self._colors.bg_tertiary,
+            text_color=self._colors.fg_primary,
+            placeholder_text_color=self._colors.fg_muted,
+            border_width=1, border_color=self._colors.border,
+        )
+        search.pack(side="left", fill="x", expand=True, padx=(0, SPACING["sm"]))
+        search.bind("<KeyRelease>", self._on_search_changed)
+        self._search_entry = search
+
+        self._period_var = self._string_var(value=_PERIODS[0])
+        self._dropdown(
+            bar, variable=self._period_var,
+            values=list(_PERIODS),
+            width=118, height=30,
+            corner_radius=RADIUS_SM,
+            font=font("sm"),
+            dropdown_font=font("sm"),
+            command=lambda _v: self._render_entries(),
+        ).pack(side="left", padx=(0, SPACING["sm"]))
+
+        secondary_button(bar, self._colors, text="Export .txt", width=90,
+                         command=self._export).pack(side="left", padx=(0, SPACING["xs"]))
+        secondary_button(bar, self._colors, text="Clear All", width=80,
+                         command=self._clear_all).pack(side="left")
+
+        self._list_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self._list_frame.pack(fill="both", expand=True)
+        self._render_entries()
+        self._add_bottom_padding(tab)
+
+    # -- Rendering ---------------------------------------------------------------
+
+    def _on_search_changed(self, _event=None) -> None:
+        # Debounced so typing doesn't rebuild the list on every keystroke
+        if self._search_job is not None:
+            try:
+                self._list_frame.after_cancel(self._search_job)
+            except Exception:
+                pass
+        self._search_job = self._list_frame.after(250, self._render_entries)
+
+    def _render_entries(self, reset: bool = True) -> None:
+        self._search_job = None
+        if reset:
+            self._shown = _PAGE_SIZE
+        for child in self._list_frame.winfo_children():
+            child.destroy()
+
+        entry = getattr(self, "_search_entry", None)
+        query = (entry.get() if entry else "").strip().lower()
+        period = self._period_var.get() if self._period_var else _PERIODS[0]
+        entries = self._history.read_all()
+        if query:
+            # The query matches the transcript text OR the entry's date stamp,
+            # so "2026-07-14" (or just "07-14") finds a day directly.
+            def _stamp(e: dict) -> str:
+                return datetime.fromtimestamp(e.get("ts", 0)).strftime("%Y-%m-%d %H:%M")
+            entries = [e for e in entries
+                       if query in e.get("text", "").lower() or query in _stamp(e)]
+        if period != _PERIODS[0]:
+            entries = [e for e in entries if self._in_period(e.get("ts", 0), period)]
+
+        if not entries:
+            card = self._card(self._list_frame)
+            filtered = bool(query) or period != _PERIODS[0]
+            message = "No matches." if filtered else "No dictations yet — press the hotkey and speak."
+            ctk.CTkLabel(
+                card, text=message,
+                font=font("sm"), text_color=self._colors.fg_muted,
+            ).pack(padx=SPACING["md"], pady=SPACING["xl"])
+            return
+
+        for entry in entries[:self._shown]:
+            self._render_entry(entry)
+
+        remaining = len(entries) - self._shown
+        if remaining > 0:
+            secondary_button(
+                self._list_frame, self._colors,
+                text=f"Show {min(remaining, _PAGE_SIZE)} more ({remaining} older)",
+                width=220,
+                command=self._show_more,
+            ).pack(pady=SPACING["sm"])
+
+    def _show_more(self) -> None:
+        self._shown += _PAGE_SIZE
+        self._render_entries(reset=False)
+
+    @staticmethod
+    def _in_period(ts: float, period: str) -> bool:
+        stamp = datetime.fromtimestamp(ts or 0)
+        day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if period == "Today":
+            return stamp >= day_start
+        if period == "Yesterday":
+            return day_start - timedelta(days=1) <= stamp < day_start
+        if period == "Last 7 days":
+            return stamp >= day_start - timedelta(days=6)
+        if period == "Last 30 days":
+            return stamp >= day_start - timedelta(days=29)
+        return True
+
+    def _render_entry(self, entry: dict) -> None:
+        card = self._card(self._list_frame)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=SPACING["md"], pady=SPACING["sm"])
+
+        # Buttons first so a narrow window squeezes the text, never them.
+        right = ctk.CTkFrame(row, fg_color="transparent")
+        right.pack(side="right")
+        ghost_button(right, self._colors, text="Copy", width=52,
+                     command=lambda t=entry.get("text", ""): self._copy(t)).pack(side="left", padx=(0, 4))
+        ghost_button(right, self._colors, text="✕", width=30,
+                     text_color=self._colors.danger,
+                     command=lambda ts=entry.get("ts"): self._delete(ts)).pack(side="left")
+
+        left = ctk.CTkFrame(row, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True)
+
+        stamp = datetime.fromtimestamp(entry.get("ts", 0)).strftime("%Y-%m-%d %H:%M")
+        meta_parts = [stamp, entry.get("model", ""), entry.get("lang", "")]
+        meta = "  ·  ".join(p for p in meta_parts if p)
+        ctk.CTkLabel(left, text=meta, font=font("xs"),
+                     text_color=self._colors.fg_muted, anchor="w").pack(anchor="w")
+        text_lbl = ctk.CTkLabel(left, text=entry.get("text", ""), font=font("sm"),
+                                text_color=self._colors.fg_primary, anchor="w",
+                                wraplength=420, justify="left")
+        text_lbl.pack(anchor="w", fill="x")
+        auto_wrap_label(text_lbl, left, padding=4)
+
+    # -- Actions -------------------------------------------------------------------
+
+    def _copy(self, text: str) -> None:
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+        except Exception as e:
+            log.debug("Copy failed: %s", e)
+
+    def _delete(self, ts) -> None:
+        self._history.delete(ts)
+        self._render_entries()
+
+    def _clear_all(self) -> None:
+        from tkinter import messagebox
+        if messagebox.askyesno(
+            "SHADOW-6", "Delete ALL saved dictations?",
+            parent=self._list_frame.winfo_toplevel(),
+        ):
+            self._history.clear()
+            self._render_entries()
+
+    def _export(self) -> None:
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(
+            parent=self._list_frame.winfo_toplevel(),
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt")],
+            initialfile="eqho-history.txt",
+        )
+        if dest:
+            count = self._history.export_txt(Path(dest))
+            log.info("Exported %d history entries to %s", count, dest)

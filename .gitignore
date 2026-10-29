@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.spec.bak
+venv/
+.venv/
+*.egg
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# App data (not secrets, but local)
+*.log
+settings.json
+
+# CodeGraph index (local, per-machine — rebuild with `codegraph init`)
+.codegraph/
+
+# whisper.cpp local build helpers (dev-only)
+_pwcpp_build.bat
+pwcpp_build*.txt
+
+# Astro landing page (site/) build artifacts — deps + generated files
+site/node_modules/
+site/.astro/
+site/dist/
+site/src/env.d.ts
+
+# local test/benchmark output (tools/bench_asr.py --work, probes)
+_bench/
+_test/
